@@ -1,4 +1,5 @@
-/////////Tecnologias e Bibliotecas Utilizadas/////////
+Tecnologias e Bibliotecas Utilizadas
+
 O microserviço foi construído com foco em leveza e alta performance matemática, utilizando a seguinte stack:
 
 Python 3.x: Linguagem base do projeto.
@@ -17,20 +18,22 @@ Feedparser: Extração automatizada de manchetes reais via RSS (ex: G1) para a e
 
 Joblib: Serialização (exportação) dos ficheiros binários .pkl contendo o cérebro treinado e o dicionário de palavras.
 
-////// Como Usar e Executar Localmente //////
-1. Preparação do Ambiente
+Como Usar e Executar Localmente 
+
+Preparação do Ambiente
 Recomenda-se a utilização de um ambiente virtual (venv). Na raiz do diretório do microserviço, instala todas as dependências necessárias através do ficheiro de configuração:
 
 Bash
 pip install -r requirements.txt
-2. Iniciar o Servidor Flask
+
+Iniciar o Servidor Flask
 Para carregar o modelo treinado (.pkl) para a memória e iniciar a escuta de requisições, executa:
 
 Bash
 python app.py
 A API ficará ativa e a escutar requisições em http://127.0.0.1:5001.
 
-3. Como Consumir a API (Exemplo de Requisição)
+Como Consumir a API (Exemplo de Requisição)
 O microserviço espera uma requisição POST na rota /predict. O corpo (body) deve ser um objeto JSON contendo a chave query.
 
 Exemplo utilizando curl:
