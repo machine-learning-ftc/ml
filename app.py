@@ -3,45 +3,57 @@ import joblib
 
 app = Flask(__name__)
 
-# 1. Carregar o .pkl do ML
+# 1. Carregar os arquivos .pkl da IA
 print("Carregando modelo SVM e vetorizador...")
 modelo = joblib.load('modelo_eleicoes.pkl')
 vetorizador = joblib.load('vetorizador.pkl')
 print("IA Pronta para uso!")
 
-# 2. A Rota de previsão
+# DEFINIÇÃO DO LIMIAR DE CONFIANÇA (THRESHOLD) PARA AS UNCERTAIN
+# 0.5 é um valor inicial. 
+# Quanto maior este número, mais conservadora e "exigente" a IA fica antes de dar um veredito.
+LIMIAR_CONFIANCA = 0.5
+
+# 2. Rota de previsão
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        # Pega o JSON do Back
+        # Pega o JSON enviado pelo Back-end
         data = request.get_json()
         
-        #  1: Usar a chave "query" em vez de "texto"
         noticia = data.get('query')
         
         if not noticia:
-            return jsonify({'erro': 'JSON invalido. Use a chave "query".'}), 400
+            return jsonify({'erro': 'JSON inválido. Use a chave "query".'}), 400
 
-        # Passa pelo processamento NLP
+        # Passa o texto recebido pelo processamento NLP (Vetorizador)
         texto_vetorizado = vetorizador.transform([noticia])
         
-        # Faz a previsão matemática
-        resultado = modelo.predict(texto_vetorizado)[0]
+        # Calcula a distância matemática até a fronteira de decisão (Certeza da IA)
+        # abs() garante que o valor seja sempre positivo
+        distancia_decisao = modelo.decision_function(texto_vetorizado)[0]
+        confianca_absoluta = abs(distancia_decisao)
         
-        # Probabilidade decimal 
-        probabilidades = modelo.predict_proba(texto_vetorizado)[0]
-        confianca_decimal = max(probabilidades)
+        # Faz a previsão bruta da máquina (1 para verdadeiro, 0 para falso)
+        predicao_bruta = modelo.predict(texto_vetorizado)[0]
 
-        # 2: Formatação 
-        if resultado == 1:
-            veredito_final = "true"
+        # 3. A TRAVA DE SEGURANÇA (Verificação do Limiar)
+        if confianca_absoluta < LIMIAR_CONFIANCA:
+            # Se a IA ficou muito em cima do muro, ela assume que não sabe
+            veredito_final = "uncertain"
+            confianca_exibida = 0.0
         else:
-            veredito_final = "false"
+            # Se ela passou do limiar de certeza, valida o resultado bruto
+            if predicao_bruta == 1:
+                veredito_final = "true"
+            else:
+                veredito_final = "false"
+            confianca_exibida = round(float(confianca_absoluta), 4)
 
-        # 3: Montando o JSON 
+        # 4. Montando o JSON 
         resposta = {
             "verdict": veredito_final,
-            "confidence": round(confianca_decimal, 4), # Arredonda para 4 casas decimais
+            "confidence": confianca_exibida, 
             "source": "machine_learning"
         }
 
