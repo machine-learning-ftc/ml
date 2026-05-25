@@ -1,35 +1,53 @@
 from flask import Flask, request, jsonify
-import joblib
 import requests
-import threading
+import os
+import json
+import re
+from google import genai
+from google.genai import types
 
 app = Flask(__name__)
 
-print("Carregando modelo SVM e vetorizador...")
-modelo = joblib.load('modelo_eleicoes.pkl')
-vetorizador = joblib.load('vetorizador.pkl')
-print("IA Pronta para uso!")
-
-LIMIAR_CONFIANCA = 0.60
-RETREINAR_A_CADA = 5  # retreina a cada 5 inferências
-contador_inferencias = 0
-
+# Chaves configuradas diretamente no código
+CHAVE_GEMINI = "AIzaSyClWzUlQlPCSGD9xepoydGZMSTV83R9Teg"
 SUPABASE_URL = "https://rmlyubbislrtgwdshmpd.supabase.co"
-API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJtbHl1YmJpc2xydGd3ZHNobXBkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODk5MTM1NSwiZXhwIjoyMDk0NTY3MzU1fQ.A4x1u2ZnxfPwiRinWf7mfUGcIOVWy2Q9U_KTRVtbZyI"
+API_KEY_SUPABASE = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJtbHl1YmJpc2xydGd3ZHNobXBkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODk5MTM1NSwiZXhwIjoyMDk0NTY3MzU1fQ.A4x1u2ZnxfPwiRinWf7mfUGcIOVWy2Q9U_KTRVtbZyI"
+
+ai_client = genai.Client(api_key=CHAVE_GEMINI)
+
 HEADERS_SUPABASE = {
-    "apikey": API_KEY,
-    "Authorization": f"Bearer {API_KEY}",
+    "apikey": API_KEY_SUPABASE,
+    "Authorization": f"Bearer {API_KEY_SUPABASE}",
     "Content-Type": "application/json"
 }
 
+def recuperar_contexto_supabase(query_usuario):
+    """Busca fatos ou checagens no banco de dados local primeiro."""
+    try:
+        endpoint = f"{SUPABASE_URL}/rest/v1/fact_checks?query=ilike.*{query_usuario}*&limit=3"
+        resposta = requests.get(endpoint, headers=HEADERS_SUPABASE)
+        
+        if resposta.status_code == 200:
+            registros = resposta.json()
+            contexto = ""
+            for reg in registros:
+                contexto += f"Fato cadastrado localmente: '{reg.get('query')}' tem o veredito confirmado como {reg.get('verdict')}.\n"
+            return contexto if contexto else "Nenhum histórico interno encontrado para este termo."
+    except Exception as e:
+        print(f"Erro ao recuperar contexto: {e}")
+    return "Erro ao recuperar base de conhecimento."
+
+
 def salvar_no_supabase(query, verdict, confidence):
+    """Salva a predição gerada pela IA na tabela do Supabase respeitando as restrições de coluna."""
     try:
         payload = {
             "query": query,
             "claim": query,
             "verdict": verdict,
-            "confidence": confidence,
-            "source": "ml",
+            "confidence": str(confidence), 
+            # Alterado de 'rag_gemini_web' para 'ml' para não quebrar a restrição (constraint) do banco
+            "source": "rag_gemini_web", 
             "status": "predicted"
         }
         resposta = requests.post(
@@ -37,127 +55,83 @@ def salvar_no_supabase(query, verdict, confidence):
             headers=HEADERS_SUPABASE,
             json=payload
         )
-        print(f"Supabase status: {resposta.status_code}")
-        print(f"Supabase resposta: {resposta.text}")
+        
+        if resposta.status_code != 201 and resposta.status_code != 200:
+            print(f"❌ Erro retornado pelo Supabase: {resposta.text}")
+            
+        resposta.raise_for_status() 
+        print(f"-> Salvo no Supabase com sucesso! Status: {resposta.status_code}")
     except Exception as e:
-        print(f"Erro ao salvar inferência: {e}")
+        print(f"Erro ao salvar resultado no Supabase: {e}")
 
-def retreinar_em_background():
-    """Executa o retreino sem travar a API"""
-    import subprocess
-    print("Retreinando modelo em background...")
-    subprocess.run(["python", "retreinar.py"])
-    
-    # Recarrega o modelo após retreino
-    global modelo, vetorizador
-    modelo = joblib.load('modelo_eleicoes.pkl')
-    vetorizador = joblib.load('vetorizador.pkl')
-    print("Modelo atualizado!")
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    global contador_inferencias
-
     try:
         data = request.get_json()
-        noticia = data.get('query')
-
-        if not noticia:
+        if not data or 'query' not in data:
             return jsonify({'erro': 'JSON inválido. Use a chave "query".'}), 400
+            
+        noticia_usuario = data.get('query')
 
-        texto_vetorizado = vetorizador.transform([noticia])
-        probabilidades = modelo.predict_proba(texto_vetorizado)[0]
-        predicao = modelo.predict(texto_vetorizado)[0]
-        confianca = max(probabilidades)
+        # 1. RETRIEVAL LOCAL: Busca primeiro no seu banco do Supabase
+        contexto_recuperado = recuperar_contexto_supabase(noticia_usuario)
 
-        if confianca < LIMIAR_CONFIANCA:
-            veredito_final = "uncertain"
-            confianca_exibida = 0.0
-        elif predicao == 1:
-            veredito_final = "true"
-            confianca_exibida = round(float(confianca), 4)
-        elif predicao == 0:
-            veredito_final = "false"
-            confianca_exibida = round(float(confianca), 4)
-        else:
-            veredito_final = "uncertain"
-            confianca_exibida = round(float(confianca), 4)
+        # 2. PROMPT DO SISTEMA: Instrução explícita para gerar a estrutura JSON manualmente
+        prompt_sistema = f"""
+        Você é um assistente especialista em Fact-Checking (checagem de fatos).
+        Sua missão é analisar se a frase enviada pelo usuário é verdadeira (true), falsa (false) ou incerta (uncertain).
 
-        # Salva a inferência no Supabase
-        salvar_no_supabase(noticia, veredito_final, confianca_exibida)
+        Regras de Busca:
+        1. Verifique o 'Contexto Local' fornecido abaixo. Se ele contiver a resposta, use-o.
+        2. Se o 'Contexto Local' disser que não encontrou histórico, utilize a ferramenta Google Search integrada para pesquisar o fato na internet em fontes de notícias confiáveis e agências de checagem.
 
-        # Incrementa contador e retreina se necessário
-        contador_inferencias += 1
-        if contador_inferencias >= RETREINAR_A_CADA:
-            contador_inferencias = 0
-            thread = threading.Thread(target=retreinar_em_background)
-            thread.daemon = True
-            thread.start()
+        Contexto Local Atual:
+        {contexto_recuperado}
 
-        return jsonify({
-            "verdict": veredito_final,
-            "confidence": confianca_exibida,
-            "source": "machine_learning"
-        })
+        ATENÇÃO: Você DEVE responder OBRIGATORIAMENTE no formato JSON puro, sem blocos de código markdown (como ```json ... 
+```), contendo exatamente esta estrutura:
+        {{"verdict": "true", "confidence": 1.0}}
+        Onde 'verdict' pode ser 'true', 'false' ou 'uncertain', e 'confidence' é um float entre 0.0 e 1.0.
+        """
 
-    except Exception as e:
-        return jsonify({'erro': f'Erro interno no servidor: {str(e)}'}), 500
-    
-@app.route('/feedback', methods=['POST'])
-def feedback():
-    try:
-        data = request.get_json()
-        query = data.get('query')
-        verdict_correto = data.get('verdict')
-
-        if not query or not verdict_correto:
-            return jsonify({'erro': 'JSON inválido. Use as chaves "query" e "verdict".'}), 400
-
-        if verdict_correto not in ['true', 'false', 'uncertain']:
-            return jsonify({'erro': 'Verdict inválido. Use "true", "false" ou "uncertain".'}), 400
-
-        busca = requests.get(
-            f"{SUPABASE_URL}/rest/v1/fact_checks?query=eq.{query}&order=id.desc&limit=1",
-            headers=HEADERS_SUPABASE
+        # 3. GENERATION COM GOOGLE SEARCH
+        resposta_ia = ai_client.models.generate_content(
+            model='gemini-2.5-flash',
+            contents=noticia_usuario,
+            config=types.GenerateContentConfig(
+                system_instruction=prompt_sistema,
+                temperature=0.1,
+                tools=[{"google_search": {}}] 
+            ),
         )
-        registros = busca.json()
 
-        if not registros:
-            resposta = requests.post(
-                f"{SUPABASE_URL}/rest/v1/fact_checks",
-                headers=HEADERS_SUPABASE,
-                json={
-                    "query": query,
-                    "claim": query,
-                    "verdict": verdict_correto,
-                    "source": "ml",
-                    "status": "predicted",
-                    "confidence": 1.0,
-                }
-            )
-            print(f"Feedback insert status: {resposta.status_code}")
-            print(f"Feedback insert resposta: {resposta.text}")
-            acao = "inserido"
-        else:
-            registro_id = registros[0]['id']
-            resposta = requests.patch(
-                f"{SUPABASE_URL}/rest/v1/fact_checks?id=eq.{registro_id}",
-                headers=HEADERS_SUPABASE,
-                json={"verdict": verdict_correto}
-            )
-            print(f"Feedback update status: {resposta.status_code}")
-            print(f"Feedback update resposta: {resposta.text}")
-            acao = "corrigido"
+        texto_resposta = resposta_ia.text.strip()
+        
+        # Limpeza de segurança caso a IA insira blocos de código markdown
+        if texto_resposta.startswith("```"):
+            texto_resposta = re.sub(r'^```[a-zA-Z]*\n|```$', '', texto_resposta, flags=re.MULTILINE).strip()
 
-        return jsonify({
-            "status": "ok",
-            "acao": acao,
-            "query": query,
-            "verdict_corrigido": verdict_correto
-        })
+        # Converte o texto JSON puro para dicionário Python
+        dados_resposta = json.loads(texto_resposta)
+        
+        # 4. SALVAMENTO AUTOMÁTICO: Envia os dados para o Supabase
+        salvar_no_supabase(
+            query=noticia_usuario, 
+            verdict=dados_resposta.get("verdict"), 
+            confidence=dados_resposta.get("confidence", 1.0)
+        )
 
+        # Adiciona a tag identificadora para o retorno da API
+        dados_resposta["source"] = "rag_gemini_web"
+
+        return jsonify(dados_resposta)
+
+    except json.JSONDecodeError:
+        return jsonify({'erro': 'A IA não retornou um JSON válido.', 'resposta_bruta': resposta_ia.text}), 500
     except Exception as e:
-        return jsonify({'erro': f'Erro interno no servidor: {str(e)}'}), 500
+        return jsonify({'erro': f'Erro interno no RAG: {str(e)}'}), 500
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True)
