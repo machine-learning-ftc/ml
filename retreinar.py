@@ -1,75 +1,135 @@
+import os
 import requests
-import pandas as pd
-from sklearn.feature_extraction.text import TfidfVectorizer
-from sklearn.svm import LinearSVC
-from sklearn.calibration import CalibratedClassifierCV
+import time
+import json
+import numpy as np
+from dotenv import load_dotenv
+from sklearn.model_selection import train_test_split
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import classification_report, accuracy_score
 import joblib
+from sentence_transformers import SentenceTransformer
 
-# 1. Credenciais do Supabase
-SUPABASE_URL = "https://rmlyubbislrtgwdshmpd.supabase.co"
-API_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJtbHl1YmJpc2xydGd3ZHNobXBkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODk5MTM1NSwiZXhwIjoyMDk0NTY3MzU1fQ.A4x1u2ZnxfPwiRinWf7mfUGcIOVWy2Q9U_KTRVtbZyI"
-NOME_TABELA = "fact_checks"
+# Carrega as variáveis de ambiente do arquivo .env
+load_dotenv()
 
-headers = {
-    "apikey": API_KEY,
-    "Authorization": f"Bearer {API_KEY}",
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+API_KEY_SUPABASE = os.getenv("API_KEY_SUPABASE")
+
+HEADERS_SUPABASE = {
+    "apikey": API_KEY_SUPABASE,
+    "Authorization": f"Bearer {API_KEY_SUPABASE}",
     "Content-Type": "application/json"
 }
 
-try:
-    # 1. DOWNLOAD com paginação
-    print("Baixando todos os dados do Supabase...")
-    todos = []
-    limit = 1000
+# Inicializa o tradutor de vetores local (MiniLM de 384 dimensões)
+print("[ML LOCAL] Carregando modelo de embedding MiniLM local...")
+encoder_local = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
+
+
+def puxar_dados_para_treino():
+    """Puxa absolutamente todos os dados que possuem vetores no banco de dados
+
+    (agora configurado com paginação inteligente para quebrar o teto de 1000 linhas).
+    """
+    print("\n[ML TREINO] Baixando a base vetorizada completa do Supabase para treino...")
+    todos_os_dados = []
     offset = 0
-
+    limite_lote = 1000
+    
     while True:
-        endpoint = f"{SUPABASE_URL}/rest/v1/{NOME_TABELA}?select=*&limit={limit}&offset={offset}"
-        resposta = requests.get(endpoint, headers=headers)
-        batch = resposta.json()
-        if not batch:
+        headers_paginado = {
+            "apikey": API_KEY_SUPABASE,
+            "Authorization": f"Bearer {API_KEY_SUPABASE}",
+            "Content-Type": "application/json",
+            "Range": f"{offset}-{offset + limite_lote - 1}"
+        }
+        
+        # Puxa os dados que já foram convertidos para 384D
+        endpoint = f"{SUPABASE_URL}/rest/v1/fact_checks?select=query,claim,verdict,embedding&embedding=not.is.null"
+        resposta = requests.get(endpoint, headers=headers_paginado)
+        
+        if resposta.status_code != 200:
+            raise Exception(f"Erro ao acessar o banco: {resposta.text}")
+            
+        dados_lote = resposta.json()
+        if not dados_lote:
             break
-        todos.extend(batch)
-        offset += limit
-        print(f"  {len(todos)} registros baixados...")
+            
+        todos_os_dados.extend(dados_lote)
+        if len(dados_lote) < limite_lote:
+            break
+            
+        offset += limite_lote
+        time.sleep(0.2)
+        
+    print(f"[ML TREINO] Base carregada! Encontrados {len(todos_os_dados)} registros vetorizados para o treino.")
+    return todos_os_dados
 
-    print(f"Total final: {len(todos)} registros")
 
-    # 2. TRANSFORMAÇÃO
-    df = pd.DataFrame(todos)
-    df_limpo = df[df['verdict'].isin(['true', 'false', 'uncertain'])].copy()
-    df_limpo['alvo'] = df_limpo['verdict'].map({'true': 1, 'false': 0, 'uncertain': 2})
+def preparar_e_treinar():
+    """Processa a matriz de dados, divide em treino/teste e calibra a Regressão Logística."""
+    dados = puxar_dados_para_treino()
+    
+    if not dados:
+        print("❌ ERRO: Nenhuma linha vetorizada disponível para treinar o modelo.")
+        return
 
-    print("Balanceamento original:")
-    print(df_limpo['verdict'].value_counts())
+    X_lista = []
+    y_lista = []
+    
+    print("[ML TREINO] Extraindo vetores e aplicando mapeamento de classes...")
+    for reg in dados:
+        verdict = str(reg.get("verdict")).lower().strip()
+        embedding_raw = reg.get("embedding")
+        
+        # Mapeamento estrito das classes
+        if verdict in ["true", "verdadeiro", "v", "1", "1.0", "correto"]:
+            classe = 1
+        elif verdict in ["false", "falso", "f", "0", "0.0", "fake", "fakenews"]:
+            classe = 0
+        else:
+            continue # Ignora nulos ou 'uncertain' na construção das fronteiras de decisão
+            
+        # Parse do vetor caso venha como String estruturada do Postgres
+        if isinstance(embedding_raw, str):
+            embedding_vetor = json.loads(embedding_raw)
+        else:
+            embedding_vetor = embedding_raw
+            
+        X_lista.append(embedding_vetor)
+        y_lista.append(classe)
+        
+    print(f"[ML TREINO] Amostras finais filtradas: {len(X_lista)} (True/False combinados).")
+    
+    if len(X_lista) == 0:
+        print("❌ ERRO CRÍTICO: Nenhum dado sobreviveu aos filtros de mapeamento textuais!")
+        return
 
-    # 3. BALANCEAMENTO true/false 50/50 (mantém todos os uncertain)
-    true_df = df_limpo[df_limpo['alvo'] == 1]
-    false_df = df_limpo[df_limpo['alvo'] == 0].sample(n=len(true_df), random_state=42)
-    uncertain_df = df_limpo[df_limpo['alvo'] == 2]
+    X = np.array(X_lista)
+    y = np.array(y_lista)
+    
+    # Separação clássica de 20% para teste empírico (Holdout)
+    X_treino, X_teste, y_treino, y_teste = train_test_split(X, y, test_size=0.2, random_state=42)
+    
+    print("[ML TREINO] Ajustando coeficientes da Regressão Logística Local...")
+    # class_weight='balanced' para calibrar as nuances entre True e False de forma justa
+    modelo = LogisticRegression(max_iter=1000, class_weight='balanced')
+    modelo.fit(X_treino, y_treino)
+    
+    # Avaliação do modelo matemático
+    predicoes = modelo.predict(X_teste)
+    precisao = accuracy_score(y_teste, predicoes)
+    
+    print(f"\n=========================================")
+    print(f"🎯 NOVA PRECISÃO DO MODELO LOCAL: {precisao * 100:.2f}%")
+    print(f"=========================================\n")
+    print(classification_report(y_teste, predicoes, target_names=["False", "True"]))
+    
+    # Exportação estável do artefato para o Flask (app.py) utilizar offline
+    joblib.dump(modelo, "modelo_fact_checker.pkl")
+    print("[ML TREINO] Arquivo 'modelo_fact_checker.pkl' atualizado com sucesso!")
 
-    df_balanceado = pd.concat([true_df, false_df, uncertain_df]).sample(frac=1, random_state=42)
 
-    print("\nBalanceamento após correção:")
-    print(df_balanceado['verdict'].value_counts())
-    print(f"Total para treino: {len(df_balanceado)} registros")
-
-    # 4. TREINAMENTO
-    print("\nIniciando retreinamento do modelo SVM...")
-    vetorizador = TfidfVectorizer(ngram_range=(1, 2))
-    svm = LinearSVC(class_weight='balanced', dual=False)
-    modelo = CalibratedClassifierCV(svm, cv=3)
-
-    x = vetorizador.fit_transform(df_balanceado['query'])
-    y = df_balanceado['alvo']
-
-    modelo.fit(x, y)
-
-    # 5. SALVAR
-    joblib.dump(vetorizador, 'vetorizador.pkl')
-    joblib.dump(modelo, 'modelo_eleicoes.pkl')
-
-    print("SUCESSO! Modelo retreinado e arquivos .pkl atualizados!")
-
-except Exception as e:
-    print(f"Erro na pipeline: {str(e)}")
+if __name__ == "__main__":
+    preparar_e_treinar()

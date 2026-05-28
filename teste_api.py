@@ -1,10 +1,10 @@
 import requests
 
-url = 'http://127.0.0.1:5001/predict'
+url = 'http://127.0.0.1:5000/predict'
 
 #EXEMPLO
 dados = {
-    "query": "Jair bolsonaro foi eleito em 2018"
+    "query": "Flávio bolsonaro será candidato a presidente em 2026"
 }
 
 print(f" Enviando dados para o microserviço: '{dados['query']}'\n")

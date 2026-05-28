@@ -1,137 +1,122 @@
-from flask import Flask, request, jsonify
-import requests
 import os
+import requests
 import json
-import re
-from google import genai
-from google.genai import types
+import numpy as np
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from dotenv import load_dotenv
+import joblib
+from sentence_transformers import SentenceTransformer
+
+# Carrega as credenciais do ambiente (.env)
+load_dotenv()
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+API_KEY_SUPABASE = os.getenv("API_KEY_SUPABASE")
 
 app = Flask(__name__)
+CORS(app) # Permite conexões de outras portas (como o seu Front-end)
 
-# Chaves configuradas diretamente no código
-CHAVE_GEMINI = "AIzaSyClWzUlQlPCSGD9xepoydGZMSTV83R9Teg"
-SUPABASE_URL = "https://rmlyubbislrtgwdshmpd.supabase.co"
-API_KEY_SUPABASE = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InJtbHl1YmJpc2xydGd3ZHNobXBkIiwicm9sZSI6InNlcnZpY2Vfcm9sZSIsImlhdCI6MTc3ODk5MTM1NSwiZXhwIjoyMDk0NTY3MzU1fQ.A4x1u2ZnxfPwiRinWf7mfUGcIOVWy2Q9U_KTRVtbZyI"
+# ==========================================
+# 🧠 CARREGAMENTO DOS COMPONENTES LOCAIS (OFFLINE)
+# ==========================================
+print("[INFO] Carregando extrator de embeddings MiniLM local...")
+encoder_local = SentenceTransformer('sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2')
 
-ai_client = genai.Client(api_key=CHAVE_GEMINI)
+CAMINHO_MODELO = "modelo_fact_checker.pkl"
 
-HEADERS_SUPABASE = {
-    "apikey": API_KEY_SUPABASE,
-    "Authorization": f"Bearer {API_KEY_SUPABASE}",
-    "Content-Type": "application/json"
-}
-
-def recuperar_contexto_supabase(query_usuario):
-    """Busca fatos ou checagens no banco de dados local primeiro."""
-    try:
-        endpoint = f"{SUPABASE_URL}/rest/v1/fact_checks?query=ilike.*{query_usuario}*&limit=3"
-        resposta = requests.get(endpoint, headers=HEADERS_SUPABASE)
-        
-        if resposta.status_code == 200:
-            registros = resposta.json()
-            contexto = ""
-            for reg in registros:
-                contexto += f"Fato cadastrado localmente: '{reg.get('query')}' tem o veredito confirmado como {reg.get('verdict')}.\n"
-            return contexto if contexto else "Nenhum histórico interno encontrado para este termo."
-    except Exception as e:
-        print(f"Erro ao recuperar contexto: {e}")
-    return "Erro ao recuperar base de conhecimento."
-
-
-def salvar_no_supabase(query, verdict, confidence):
-    """Salva a predição gerada pela IA na tabela do Supabase respeitando as restrições de coluna."""
-    try:
-        payload = {
-            "query": query,
-            "claim": query,
-            "verdict": verdict,
-            "confidence": str(confidence), 
-            # Alterado de 'rag_gemini_web' para 'ml' para não quebrar a restrição (constraint) do banco
-            "source": "rag_gemini_web", 
-            "status": "predicted"
-        }
-        resposta = requests.post(
-            f"{SUPABASE_URL}/rest/v1/fact_checks",
-            headers=HEADERS_SUPABASE,
-            json=payload
-        )
-        
-        if resposta.status_code != 201 and resposta.status_code != 200:
-            print(f"❌ Erro retornado pelo Supabase: {resposta.text}")
-            
-        resposta.raise_for_status() 
-        print(f"-> Salvo no Supabase com sucesso! Status: {resposta.status_code}")
-    except Exception as e:
-        print(f"Erro ao salvar resultado no Supabase: {e}")
+if os.path.exists(CAMINHO_MODELO):
+    print(f"[INFO] Carregando cérebro estatístico '{CAMINHO_MODELO}'...")
+    modelo_logistica = joblib.load(CAMINHO_MODELO)
+    print("[INFO] Microserviço de ML pronto para receber requisições!")
+else:
+    print(f"❌ ERRO CRÍTICO: O arquivo '{CAMINHO_MODELO}' não foi encontrado!")
+    print("Execute o script 'retreinar.py' primeiro para gerar o modelo.")
+    exit(1)
 
 
 @app.route('/predict', methods=['POST'])
 def predict():
     try:
-        data = request.get_json()
-        if not data or 'query' not in data:
-            return jsonify({'erro': 'JSON inválido. Use a chave "query".'}), 400
-            
-        noticia_usuario = data.get('query')
+        dados_requisicao = request.get_json()
+        if not dados_requisicao:
+            return jsonify({"error": "Payload JSON ausente ou inválido"}), 400
 
-        # 1. RETRIEVAL LOCAL: Busca primeiro no seu banco do Supabase
-        contexto_recuperado = recuperar_contexto_supabase(noticia_usuario)
+        # Flexibilidade para ler qualquer mapeamento de texto enviado pelo cliente
+        texto_noticia = dados_requisicao.get("query") or dados_requisicao.get("claim") or dados_requisicao.get("text")
 
-        # 2. PROMPT DO SISTEMA: Instrução explícita para gerar a estrutura JSON manualmente
-        prompt_sistema = f"""
-        Você é um assistente especialista em Fact-Checking (checagem de fatos).
-        Sua missão é analisar se a frase enviada pelo usuário é verdadeira (true), falsa (false) ou incerta (uncertain).
+        if not texto_noticia:
+            return jsonify({"error": "Texto da notícia não fornecido no campo 'query' ou 'claim'"}), 400
 
-        Regras de Busca:
-        1. Verifique o 'Contexto Local' fornecido abaixo. Se ele contiver a resposta, use-o.
-        2. Se o 'Contexto Local' disser que não encontrou histórico, utilize a ferramenta Google Search integrada para pesquisar o fato na internet em fontes de notícias confiáveis e agências de checagem.
+        # 1. Extração de Features Semânticas (384 dimensões) - 100% OFFLINE
+        print(f"\n[ML LOCAL] Vetorizando entrada: '{texto_noticia}'")
+        embedding_numerico = encoder_local.encode(texto_noticia).tolist()
 
-        Contexto Local Atual:
-        {contexto_recuperado}
+        # 2. Predição via Regressão Logística Local
+        # Enviamos como uma matriz de uma única linha: [embedding_numerico]
+        probabilidades = modelo_logistica.predict_proba([embedding_numerico])[0]
+        confianca_calculada = float(np.max(probabilidades))
+        classe_predita = int(np.argmax(probabilidades))
 
-        ATENÇÃO: Você DEVE responder OBRIGATORIAMENTE no formato JSON puro, sem blocos de código markdown (como ```json ... 
-```), contendo exatamente esta estrutura:
-        {{"verdict": "true", "confidence": 1.0}}
-        Onde 'verdict' pode ser 'true', 'false' ou 'uncertain', e 'confidence' é um float entre 0.0 e 1.0.
-        """
+        # Determina o veredito baseado na maior probabilidade matemática
+        veredito_final = "true" if classe_predita == 1 else "false"
 
-        # 3. GENERATION COM GOOGLE SEARCH
-        resposta_ia = ai_client.models.generate_content(
-            model='gemini-2.5-flash',
-            contents=noticia_usuario,
-            config=types.GenerateContentConfig(
-                system_instruction=prompt_sistema,
-                temperature=0.1,
-                tools=[{"google_search": {}}] 
-            ),
+        # 🚀 FILTRO DE CONFIABILIDADE (THRESHOLD): 
+        # Se a certeza estatística for menor que 75%, o sistema recua e crava 'uncertain'.
+        # Isso blinda o front contra erros lógicos (como as negações políticas).
+        if confianca_calculada < 0.75:
+            print(f"[ML LOCAL] Confiança de {confianca_calculada*100:.2f}% abaixo do limite. Classificado como UNCERTAIN.")
+            veredito_final = "uncertain"
+        else:
+            print(f"[ML LOCAL] Decisão cravada como '{veredito_final}' com {confianca_calculada*100:.2f}% de certeza.")
+
+        # 3. SALVAMENTO DA INFERÊNCIA NO HISTÓRICO (SUPABASE)
+        # Formata o array numérico no formato string vetorial exigido pelo pgvector: '[x, y, z...]'
+        embedding_string = "[" + ",".join(map(str, embedding_numerico)) + "]"
+        
+        # 🚀 CORREÇÃO: Preenchemos query E claim para satisfazer a restrição Not-Null do banco
+        payload_supabase = {
+            "query": texto_noticia,  
+            "claim": texto_noticia,
+            "verdict": veredito_final,
+            "confidence": round(confianca_calculada, 2),
+            "embedding": embedding_string,
+            "source": "ml",
+            "status": "predicted",
+        }
+
+        print("[API] Enviando dados para gravação no Supabase...")
+        resposta_supabase = requests.post(
+            f"{SUPABASE_URL}/rest/v1/fact_checks",
+            headers={
+                "apikey": API_KEY_SUPABASE,
+                "Authorization": f"Bearer {API_KEY_SUPABASE}",
+                "Content-Type": "application/json",
+                "Prefer": "return=representation"
+            },
+            json=payload_supabase
         )
 
-        texto_resposta = resposta_ia.text.strip()
-        
-        # Limpeza de segurança caso a IA insira blocos de código markdown
-        if texto_resposta.startswith("```"):
-            texto_resposta = re.sub(r'^```[a-zA-Z]*\n|```$', '', texto_resposta, flags=re.MULTILINE).strip()
+        # Monitoramento ativo do status da requisição ao banco
+        if resposta_supabase.status_code not in [200, 201, 204]:
+            print(f"⚠️ Alerta: Inferência calculada, mas rejeitada pelo Supabase.")
+            print(f"   -> Código HTTP: {resposta_supabase.status_code}")
+            print(f"   -> Motivo técnico: {resposta_supabase.text}")
+        else:
+            print("✅ Histórico de inferência persistido com sucesso no banco!")
 
-        # Converte o texto JSON puro para dicionário Python
-        dados_resposta = json.loads(texto_resposta)
-        
-        # 4. SALVAMENTO AUTOMÁTICO: Envia os dados para o Supabase
-        salvar_no_supabase(
-            query=noticia_usuario, 
-            verdict=dados_resposta.get("verdict"), 
-            confidence=dados_resposta.get("confidence", 1.0)
-        )
+        # 4. Resposta entregue para o cliente (Ex: teste_api.py ou Front)
+        return jsonify({
+            "verdict": veredito_final,
+            "confidence": round(confianca_calculada, 2),
+            "source": "offline_ml_local"
+        }), 200
 
-        # Adiciona a tag identificadora para o retorno da API
-        dados_resposta["source"] = "rag_gemini_web"
-
-        return jsonify(dados_resposta)
-
-    except json.JSONDecodeError:
-        return jsonify({'erro': 'A IA não retornou um JSON válido.', 'resposta_bruta': resposta_ia.text}), 500
     except Exception as e:
-        return jsonify({'erro': f'Erro interno no RAG: {str(e)}'}), 500
+        print(f"❌ Erro interno na execução do Flask: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5001, debug=True)
+    # Roda o microserviço local na porta padrão 5000
+    app.run(host='0.0.0.0', port=5000, debug=True)
