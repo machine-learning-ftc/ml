@@ -1,0 +1,29 @@
+# Python
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.egg-info
+
+# Ambiente
+.env
+
+# Git
+.git
+.gitignore
+
+# Notebooks e testes (não necessários no container)
+*.ipynb
+teste_api.py
+retreinar.py
+
+# Documentação
+README.md
+*.md
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Colab
+colab link.txt
